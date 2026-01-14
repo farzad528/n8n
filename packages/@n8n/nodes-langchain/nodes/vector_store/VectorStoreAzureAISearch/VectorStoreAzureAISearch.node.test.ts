@@ -12,6 +12,9 @@ import {
 	VectorStoreAzureAISearch,
 	getIndexName,
 	clearAzureSearchIndex,
+	RETRIEVAL_MODE,
+	KNOWLEDGE_BASE_NAME,
+	INCLUDE_ACTIVITY,
 } from './VectorStoreAzureAISearch.node';
 
 jest.mock('@langchain/community/vectorstores/azure_aisearch');
@@ -271,6 +274,95 @@ describe('VectorStoreAzureAISearch', () => {
 			expect(mockLogger.debug).toHaveBeenCalledWith('Error deleting index (may not exist):', {
 				message: 'Index not found',
 			});
+		});
+	});
+
+	describe('Knowledge Base Mode', () => {
+		const helpers = mock<ISupplyDataFunctions['helpers']>();
+		const kbExecuteFunctions = mock<ISupplyDataFunctions>({ helpers });
+		const mockNode = mock<INode>();
+		const mockLogger = { debug: jest.fn() };
+
+		beforeEach(() => {
+			jest.clearAllMocks();
+			kbExecuteFunctions.addInputData.mockReturnValue({ index: 0 });
+			kbExecuteFunctions.getNode.mockReturnValue(mockNode);
+			kbExecuteFunctions.logger = mockLogger as unknown as ISupplyDataFunctions['logger'];
+		});
+
+		it('should return KB wrapper when retrievalMode is knowledgeBase', async () => {
+			kbExecuteFunctions.getNodeParameter.mockImplementation((paramName: string) => {
+				switch (paramName) {
+					case 'mode':
+						return 'retrieve';
+					case RETRIEVAL_MODE:
+						return 'knowledgeBase';
+					case KNOWLEDGE_BASE_NAME:
+						return 'test-knowledge-base';
+					case INCLUDE_ACTIVITY:
+						return false;
+					case 'options':
+						return {};
+					default:
+						return undefined;
+				}
+			});
+
+			kbExecuteFunctions.getCredentials.mockResolvedValue({
+				endpoint: 'https://test-search.search.windows.net',
+				apiKey: 'test-api-key',
+			});
+
+			const mockEmbeddings = {};
+			kbExecuteFunctions.getInputConnectionData.mockResolvedValue(mockEmbeddings);
+
+			const vectorStoreNode = new VectorStoreAzureAISearch();
+			const { response } = await vectorStoreNode.supplyData.call(kbExecuteFunctions, 0);
+
+			// When KB mode is active, it should NOT call AzureAISearchVectorStore
+			// Instead it returns a KnowledgeBaseVectorStoreWrapper
+			expect(response).toBeDefined();
+			// The wrapper should have similaritySearch method
+			expect(typeof (response as any).similaritySearch).toBe('function');
+		});
+
+		it('should use index mode by default when retrievalMode is not set', async () => {
+			kbExecuteFunctions.getNodeParameter.mockImplementation((paramName: string) => {
+				switch (paramName) {
+					case 'mode':
+						return 'retrieve';
+					case RETRIEVAL_MODE:
+						return 'index'; // Default value
+					case 'indexName':
+						return 'test-index';
+					case 'options':
+						return {};
+					default:
+						return undefined;
+				}
+			});
+
+			kbExecuteFunctions.getCredentials.mockResolvedValue({
+				endpoint: 'https://test-search.search.windows.net',
+				apiKey: 'test-api-key',
+			});
+
+			const mockEmbeddings = {};
+			kbExecuteFunctions.getInputConnectionData.mockResolvedValue(mockEmbeddings);
+
+			const vectorStoreNode = new VectorStoreAzureAISearch();
+			const { response } = await vectorStoreNode.supplyData.call(kbExecuteFunctions, 0);
+
+			expect(response).toBeDefined();
+			// In index mode, AzureAISearchVectorStore should be called
+			expect(AzureAISearchVectorStore).toHaveBeenCalled();
+		});
+
+		it('should export KB-related constants', () => {
+			// Verify that the KB constants are exported correctly
+			expect(RETRIEVAL_MODE).toBe('retrievalMode');
+			expect(KNOWLEDGE_BASE_NAME).toBe('knowledgeBaseName');
+			expect(INCLUDE_ACTIVITY).toBe('includeActivity');
 		});
 	});
 });

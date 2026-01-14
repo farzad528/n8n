@@ -3,6 +3,7 @@ import {
 	AzureAISearchVectorStore,
 	AzureAISearchQueryType,
 } from '@langchain/community/vectorstores/azure_aisearch';
+import { Document } from '@langchain/core/documents';
 import type { EmbeddingsInterface } from '@langchain/core/embeddings';
 import {
 	NodeOperationError,
@@ -18,11 +19,21 @@ import { createVectorStoreNode } from '../shared/createVectorStoreNode/createVec
 // User agent for usage tracking
 const USER_AGENT_PREFIX = 'n8n-azure-ai-search';
 
+// Knowledge Base API version (preview)
+const KB_API_VERSION = '2025-11-01-preview';
+
 export const AZURE_AI_SEARCH_CREDENTIALS = 'azureAiSearchApi';
 export const INDEX_NAME = 'indexName';
 export const QUERY_TYPE = 'queryType';
 export const FILTER = 'filter';
 export const SEMANTIC_CONFIGURATION = 'semanticConfiguration';
+
+// Knowledge Base specific constants
+export const RETRIEVAL_MODE = 'retrievalMode';
+export const KNOWLEDGE_BASE_NAME = 'knowledgeBaseName';
+export const OUTPUT_MODE = 'outputMode';
+export const REASONING_EFFORT = 'reasoningEffort';
+export const INCLUDE_ACTIVITY = 'includeActivity';
 
 const indexNameField: INodeProperties = {
 	displayName: 'Index Name',
@@ -32,6 +43,11 @@ const indexNameField: INodeProperties = {
 	description:
 		'The name of the Azure AI Search index. Will be created automatically if it does not exist.',
 	required: true,
+	displayOptions: {
+		hide: {
+			[RETRIEVAL_MODE]: ['knowledgeBase'],
+		},
+	},
 };
 
 const queryTypeField: INodeProperties = {
@@ -82,7 +98,139 @@ const semanticConfigurationField: INodeProperties = {
 	},
 };
 
-const sharedFields: INodeProperties[] = [indexNameField];
+// Retrieval Mode selector - top-level choice between Index and Knowledge Base
+const retrievalModeField: INodeProperties = {
+	displayName: 'Retrieval Mode',
+	name: RETRIEVAL_MODE,
+	type: 'options',
+	noDataExpression: true,
+	default: 'index',
+	description: 'Choose between a search index or knowledge base for retrieval',
+	options: [
+		{
+			name: 'Search Index',
+			value: 'index',
+			description: 'Use a traditional Azure AI Search index',
+		},
+		{
+			name: 'Knowledge Base (Preview)',
+			value: 'knowledgeBase',
+			description: 'Use FoundryIQ Knowledge Base for agentic retrieval with LLM-powered answers',
+		},
+	],
+	displayOptions: {
+		show: {
+			mode: ['load', 'retrieve', 'retrieve-as-tool'],
+		},
+	},
+};
+
+// Knowledge Base specific fields
+const knowledgeBaseNameField: INodeProperties = {
+	displayName: 'Knowledge Base Name',
+	name: KNOWLEDGE_BASE_NAME,
+	type: 'string',
+	required: true,
+	default: '',
+	description: 'Name of the Knowledge Base to query',
+	displayOptions: {
+		show: {
+			[RETRIEVAL_MODE]: ['knowledgeBase'],
+		},
+	},
+};
+
+const outputModeField: INodeProperties = {
+	displayName: 'Output Mode',
+	name: OUTPUT_MODE,
+	type: 'options',
+	default: 'answerSynthesis',
+	description: 'How to format retrieval results',
+	options: [
+		{
+			name: 'Answer Synthesis',
+			value: 'answerSynthesis',
+			description: 'LLM-generated answer with citations',
+		},
+		{
+			name: 'Extracted Data',
+			value: 'extractedData',
+			description: 'Raw search results from knowledge sources',
+		},
+	],
+	displayOptions: {
+		show: {
+			[RETRIEVAL_MODE]: ['knowledgeBase'],
+		},
+	},
+};
+
+const reasoningEffortField: INodeProperties = {
+	displayName: 'Reasoning Effort',
+	name: REASONING_EFFORT,
+	type: 'options',
+	default: 'low',
+	description: 'How much LLM processing to use for query planning',
+	options: [
+		{
+			name: 'Minimal',
+			value: 'minimal',
+			description: 'No LLM - queries all sources',
+		},
+		{
+			name: 'Low',
+			value: 'low',
+			description: 'Basic LLM source selection (default)',
+		},
+		{
+			name: 'Medium',
+			value: 'medium',
+			description: 'More LLM processing for relevance',
+		},
+	],
+	displayOptions: {
+		show: {
+			[RETRIEVAL_MODE]: ['knowledgeBase'],
+		},
+	},
+};
+
+const includeActivityField: INodeProperties = {
+	displayName: 'Include Activity',
+	name: INCLUDE_ACTIVITY,
+	type: 'boolean',
+	default: false,
+	description: 'Whether to include retrieval activity details in response',
+	displayOptions: {
+		show: {
+			[RETRIEVAL_MODE]: ['knowledgeBase'],
+		},
+	},
+};
+
+// Notice for KB mode about embeddings
+const kbEmbeddingsNotice: INodeProperties = {
+	displayName:
+		'Knowledge Base mode handles embeddings internally. The Embedding input connection is not used.',
+	name: 'kbEmbeddingsNotice',
+	type: 'notice',
+	default: '',
+	displayOptions: {
+		show: {
+			[RETRIEVAL_MODE]: ['knowledgeBase'],
+		},
+	},
+};
+
+const sharedFields: INodeProperties[] = [
+	retrievalModeField,
+	kbEmbeddingsNotice,
+	knowledgeBaseNameField,
+	outputModeField,
+	reasoningEffortField,
+	includeActivityField,
+	indexNameField,
+];
 
 const retrieveFields: INodeProperties[] = [
 	{
@@ -92,6 +240,11 @@ const retrieveFields: INodeProperties[] = [
 		placeholder: 'Add Option',
 		default: {},
 		options: [queryTypeField, filterField, semanticConfigurationField],
+		displayOptions: {
+			hide: {
+				[RETRIEVAL_MODE]: ['knowledgeBase'],
+			},
+		},
 	},
 ];
 
@@ -336,6 +489,208 @@ function getQueryType(
 	}
 }
 
+// ============================================================================
+// Knowledge Base Types and Functions
+// ============================================================================
+
+interface KnowledgeBaseRetrievalRequest {
+	messages: Array<{
+		role: 'system' | 'assistant' | 'user';
+		content: Array<{ type: 'text'; text: string }>;
+	}>;
+	includeActivity?: boolean;
+}
+
+interface KnowledgeBaseRetrievalResponse {
+	response: Array<{
+		content: Array<{ type: 'text'; text: string }>;
+	}>;
+	activity?: unknown;
+}
+
+/**
+ * Retrieves data from a Knowledge Base using the Azure AI Search Agentic Retrieval API.
+ * This is a direct REST API call since LangChain.JS does not support Knowledge Bases.
+ */
+async function retrieveFromKnowledgeBase(
+	context: IExecuteFunctions | ISupplyDataFunctions,
+	itemIndex: number,
+	query: string,
+): Promise<KnowledgeBaseRetrievalResponse> {
+	const credentials = await getValidatedCredentials(context, itemIndex);
+	const knowledgeBaseName = context.getNodeParameter(KNOWLEDGE_BASE_NAME, itemIndex, '') as string;
+	const includeActivity = context.getNodeParameter(INCLUDE_ACTIVITY, itemIndex, false) as boolean;
+
+	if (!knowledgeBaseName) {
+		throw new NodeOperationError(
+			context.getNode(),
+			'Knowledge Base Name is required when using Knowledge Base mode',
+			{ itemIndex },
+		);
+	}
+
+	const url = `${credentials.endpoint}/knowledgebases('${encodeURIComponent(knowledgeBaseName)}')/retrieve?api-version=${KB_API_VERSION}`;
+
+	const requestBody: KnowledgeBaseRetrievalRequest = {
+		messages: [
+			{
+				role: 'user',
+				content: [{ type: 'text', text: query }],
+			},
+		],
+		includeActivity,
+	};
+
+	try {
+		const response = await context.helpers.httpRequest({
+			method: 'POST',
+			url,
+			headers: {
+				'Content-Type': 'application/json',
+				'api-key': credentials.apiKey,
+				Accept: 'application/json;odata.metadata=minimal',
+			},
+			body: requestBody,
+			json: true,
+		});
+
+		return response as KnowledgeBaseRetrievalResponse;
+	} catch (error) {
+		const errorObj = error as { message?: string; statusCode?: number };
+		const errorMessage = error instanceof Error ? error.message : String(error);
+
+		// Log the full error for debugging
+		context.logger.debug('Knowledge Base retrieval error:', {
+			message: errorMessage,
+			statusCode: errorObj.statusCode,
+		});
+
+		// Check for authentication errors
+		if (
+			errorMessage.includes('401') ||
+			errorMessage.includes('Unauthorized') ||
+			errorObj.statusCode === 401
+		) {
+			throw new NodeOperationError(
+				context.getNode(),
+				'Authentication failed - invalid API key or endpoint.',
+				{
+					itemIndex,
+					description:
+						'Please verify your API Key and Search Endpoint are correct in the credentials configuration.',
+				},
+			);
+		}
+
+		// Check for not found errors (KB doesn't exist)
+		if (errorMessage.includes('404') || errorObj.statusCode === 404) {
+			throw new NodeOperationError(
+				context.getNode(),
+				`Knowledge Base '${knowledgeBaseName}' not found.`,
+				{
+					itemIndex,
+					description:
+						'Please verify the Knowledge Base name is correct and exists in your Azure AI Search service.',
+				},
+			);
+		}
+
+		throw new NodeOperationError(
+			context.getNode(),
+			`Knowledge Base retrieval error: ${errorMessage}`,
+			{
+				itemIndex,
+				description: 'Please check your Knowledge Base configuration and Azure AI Search service.',
+			},
+		);
+	}
+}
+
+/**
+ * Converts a Knowledge Base retrieval response to LangChain Document format.
+ */
+function kbResponseToDocuments(response: KnowledgeBaseRetrievalResponse): Document[] {
+	const documents: Document[] = [];
+
+	for (const item of response.response) {
+		for (const content of item.content) {
+			if (content.type === 'text') {
+				documents.push(
+					new Document({
+						pageContent: content.text,
+						metadata: {
+							source: 'knowledge-base',
+						},
+					}),
+				);
+			}
+		}
+	}
+
+	return documents;
+}
+
+/**
+ * A wrapper class that implements VectorStore-like interface for Knowledge Base retrieval.
+ * This allows KB to be used with the existing n8n vector store infrastructure.
+ */
+class KnowledgeBaseVectorStoreWrapper {
+	constructor(
+		private context: IExecuteFunctions | ISupplyDataFunctions,
+		private itemIndex: number,
+	) {}
+
+	async similaritySearch(query: string, k?: number): Promise<Document[]> {
+		const response = await retrieveFromKnowledgeBase(this.context, this.itemIndex, query);
+		return kbResponseToDocuments(response).slice(0, k ?? 4);
+	}
+
+	async similaritySearchWithScore(query: string, k?: number): Promise<Array<[Document, number]>> {
+		const docs = await this.similaritySearch(query, k);
+		// KB doesn't return scores, use 1.0 as placeholder for compatibility
+		return docs.map((doc) => [doc, 1.0] as [Document, number]);
+	}
+
+	async similaritySearchVectorWithScore(
+		_query: number[],
+		_k: number,
+		_filter?: unknown,
+	): Promise<Array<[Document, number]>> {
+		// For KB mode, we can't do vector search directly - we need the text query
+		// This method is called by the base node, so we throw an informative error
+		throw new NodeOperationError(
+			this.context.getNode(),
+			'Knowledge Base mode does not support direct vector search. Please use text-based search.',
+			{ itemIndex: this.itemIndex },
+		);
+	}
+
+	asRetriever(options?: { k?: number }) {
+		const k = options?.k ?? 4;
+		return {
+			invoke: async (query: string) => await this.similaritySearch(query, k),
+			getRelevantDocuments: async (query: string) => await this.similaritySearch(query, k),
+		};
+	}
+}
+
+/**
+ * Gets the retrieval mode from node parameters.
+ * Returns 'index' by default for backward compatibility.
+ */
+function getRetrievalMode(
+	context: IExecuteFunctions | ISupplyDataFunctions,
+	itemIndex: number,
+): 'index' | 'knowledgeBase' {
+	try {
+		const mode = context.getNodeParameter(RETRIEVAL_MODE, itemIndex, 'index') as string;
+		return mode === 'knowledgeBase' ? 'knowledgeBase' : 'index';
+	} catch {
+		// Parameter might not exist in older workflows
+		return 'index';
+	}
+}
+
 export class VectorStoreAzureAISearch extends createVectorStoreNode({
 	meta: {
 		displayName: 'Azure AI Search Vector Store',
@@ -357,6 +712,18 @@ export class VectorStoreAzureAISearch extends createVectorStoreNode({
 	loadFields: retrieveFields,
 	insertFields,
 	async getVectorStoreClient(context, _filter, embeddings, itemIndex) {
+		// Check if we're in Knowledge Base mode (only for execution contexts)
+		if (isExecutionContext(context)) {
+			const retrievalMode = getRetrievalMode(context, itemIndex);
+
+			if (retrievalMode === 'knowledgeBase') {
+				// Return Knowledge Base wrapper instead of traditional vector store
+				// The KB wrapper handles retrieval via direct REST API calls
+				return new KnowledgeBaseVectorStoreWrapper(context, itemIndex) as any;
+			}
+		}
+
+		// Index mode: use traditional Azure AI Search vector store
 		const vectorStore = await getAzureAISearchClient(context, embeddings, itemIndex);
 
 		// Apply OData filter to search methods if specified in options
